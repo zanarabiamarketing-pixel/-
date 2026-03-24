@@ -1,128 +1,116 @@
-const express = require('express');
-const cors = require('cors');
-const { YoutubeTranscript } = require('youtube-transcript');
+const express = require("express");
+const cors = require("cors");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(cors());
-app.use(express.json());
 
-function extractVideoId(input) {
-  if (!input) return null;
+function extractVideoId(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes("youtu.be")) {
+      return u.pathname.replace("/", "");
+    }
+    return u.searchParams.get("v");
+  } catch {
+    return url;
+  }
+}
 
-  // raw ID
-  if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
+function decodeHtml(text) {
+  return String(text)
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'");
+}
+
+function extractCaptionTracks(html) {
+  const match = html.match(/"captionTracks":(\[.*?\])/);
+  if (!match) return [];
 
   try {
-    const url = new URL(input);
+    return JSON.parse(match[1]);
+  } catch {
+    return [];
+  }
+}
 
-    if (url.hostname.includes('youtu.be')) {
-      const id = url.pathname.replace(/^\//, '').split('/')[0];
-      return /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
-    }
+function parseXmlTranscript(xml) {
+  const results = [];
+  const regex = /<text[^>]*start="([^"]+)"[^>]*>([\s\S]*?)<\/text>/g;
+  let m;
 
-    if (url.searchParams.get('v')) {
-      const id = url.searchParams.get('v');
-      return /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
-    }
-
-    const parts = url.pathname.split('/').filter(Boolean);
-    const shortsIndex = parts.indexOf('shorts');
-    if (shortsIndex !== -1 && parts[shortsIndex + 1]) {
-      const id = parts[shortsIndex + 1];
-      return /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
-    }
-  } catch (_) {
-    return null;
+  while ((m = regex.exec(xml)) !== null) {
+    const start = parseFloat(m[1] || "0");
+    const text = decodeHtml(m[2].replace(/<[^>]+>/g, "").trim());
+    if (text) results.push({ start, text });
   }
 
-  return null;
+  return results;
 }
 
-function normalizeLanguage(lang) {
-  if (!lang) return '';
-  return String(lang).trim().toLowerCase();
-}
-
-function formatTime(seconds) {
-  const total = Math.floor(Number(seconds || 0));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-
-  if (h > 0) {
-    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  }
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-
-function transcriptToText(items, includeTimestamps = false) {
-  if (!includeTimestamps) {
-    return items.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
-  }
-
-  return items
-    .map(item => `[${formatTime(item.offset / 1000)}] ${item.text}`)
-    .join('\n');
-}
-
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'yt-transcript-api',
-    endpoint: '/api/transcript?url=YOUTUBE_URL&lang=ar&timestamps=1'
-  });
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "yt transcript api" });
 });
 
-app.get('/api/transcript', async (req, res) => {
+app.get("/api/transcript", async (req, res) => {
   try {
-    const input = req.query.url || req.query.video || req.query.id;
-    const language = normalizeLanguage(req.query.lang);
-    const includeTimestamps = String(req.query.timestamps || '').trim() === '1';
+    const { url } = req.query;
 
-    const videoId = extractVideoId(input);
+    if (!url) {
+      return res.status(400).json({ error: "Missing url" });
+    }
+
+    const videoId = extractVideoId(url);
     if (!videoId) {
-      return res.status(400).json({
-        ok: false,
-        error: 'رابط الفيديو أو معرف الفيديو غير صحيح'
-      });
+      return res.status(400).json({ error: "Invalid YouTube URL" });
     }
 
-    let transcript;
-    if (language) {
-      transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: language });
-    } else {
-      transcript = await YoutubeTranscript.fetchTranscript(videoId);
+    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
+
+    const html = await pageRes.text();
+    const tracks = extractCaptionTracks(html);
+
+    if (!tracks.length) {
+      return res.status(404).json({ error: "No captions found" });
     }
 
-    if (!Array.isArray(transcript) || transcript.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: 'لم يتم العثور على ترجمة لهذا الفيديو'
-      });
+    const captionUrl = String(tracks[0].baseUrl).replace(/\\u0026/g, "&");
+
+    const capRes = await fetch(captionUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
+
+    const xml = await capRes.text();
+    const items = parseXmlTranscript(xml);
+
+    if (!items.length) {
+      return res.status(404).json({ error: "Transcript is empty" });
     }
 
-    const text = transcriptToText(transcript, includeTimestamps);
+    const text = items.map(x => x.text).join(" ");
 
-    return res.json({
+    res.json({
       ok: true,
       videoId,
-      language: language || 'auto',
-      timestamps: includeTimestamps,
-      count: transcript.length,
-      text,
-      transcript
+      count: items.length,
+      text
     });
   } catch (error) {
-    const message = error && error.message ? error.message : 'حدث خطأ أثناء استخراج الترجمة';
-    return res.status(500).json({
-      ok: false,
-      error: message
-    });
+    console.error(error);
+    res.status(500).json({ error: "Failed to fetch transcript" });
   }
 });
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

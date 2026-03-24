@@ -82,7 +82,7 @@ app.get("/api/transcript", async (req, res) => {
       url
     ];
 
-    await run("yt-dlp", args);
+    await run("python3", ["-m", "yt_dlp", ...args]);
 
     const files = fs.readdirSync(tmpDir);
     const vttFile = files.find(f => f.endsWith(".vtt"));
